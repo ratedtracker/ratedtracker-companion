@@ -7,3 +7,6 @@ google-auth.json
 .DS_Store
 Thumbs.db
 _tmp_*.ps1
+_tmp_*.js
+run-out.txt
+run-err.txt
