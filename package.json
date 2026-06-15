@@ -1,0 +1,79 @@
+{
+  "name": "ratedtracker-companion",
+  "productName": "RatedTracker Companion",
+  "version": "1.1.1",
+  "description": "RatedTracker desktop app. Auto-syncs your World of Warcraft combat logs to ratedtracker.com.",
+  "author": "RatedTracker",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux",
+    "publish:win": "electron-builder --win --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.ratedtracker.companion",
+    "productName": "RatedTracker Companion",
+    "beforeBuild": "build/before-build.js",
+    "files": [
+      "main.js",
+      "preload.js",
+      "generated-config.js",
+      "assets/**"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "ratedtracker",
+        "repo": "ratedtracker-companion",
+        "releaseType": "release"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "artifactName": "RatedTrackerCompanion-Setup.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.games",
+      "identity": null
+    },
+    "dmg": {
+      "title": "RatedTracker Companion",
+      "artifactName": "RatedTrackerCompanion.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "assets/icon.png",
+      "category": "Game",
+      "artifactName": "RatedTrackerCompanion.${ext}"
+    }
+  }
+}
