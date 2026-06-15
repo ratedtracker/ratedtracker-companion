@@ -1074,41 +1074,64 @@ function createWindow() {
   const ZOOM_MIN = 0.5;
   const ZOOM_MAX = 3;
   const ZOOM_STEP = 0.1;
+  function clampZoom(f) {
+    return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round((Number(f) || 1) * 100) / 100));
+  }
+  function currentZoom() {
+    try {
+      const z = mainWindow.webContents.getZoomFactor();
+      if (z && isFinite(z)) return z;
+    } catch (e) {
+      /* window gone */
+    }
+    return companionPrefs.zoomFactor || 1;
+  }
   function applyZoom(f) {
-    const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(f * 100) / 100));
-    companionPrefs.zoomFactor = z;
+    const z = clampZoom(f);
     try {
       mainWindow.webContents.setZoomFactor(z);
     } catch (e) {
       /* window gone */
     }
+    companionPrefs.zoomFactor = z;
     saveCompanionPrefs();
   }
-  mainWindow.webContents.on("did-finish-load", () => {
+  // Chromium resets a webContents to its per-origin default zoom on every navigation, and that
+  // reset can land a tick AFTER did-finish-load fires, so a single setZoomFactor there does not
+  // stick (the user's chosen size snaps back to 100% on the next reload). Reapply the saved zoom
+  // immediately and again on short timers so it survives the reset.
+  function reapplySavedZoom() {
     try {
-      mainWindow.webContents.setZoomFactor(companionPrefs.zoomFactor || 1);
+      mainWindow.webContents.setZoomFactor(clampZoom(companionPrefs.zoomFactor || 1));
     } catch (e) {
       /* window gone */
     }
+  }
+  mainWindow.webContents.on("did-finish-load", () => {
+    reapplySavedZoom();
+    setTimeout(reapplySavedZoom, 80);
+    setTimeout(reapplySavedZoom, 400);
     if (updateDownloaded) injectUpdateBanner(updateReadyVersion);
   });
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown" || !input.control || input.alt || input.meta) return;
     const k = input.key || "";
     if (k === "+" || k === "=" || k === "Add") {
-      applyZoom((companionPrefs.zoomFactor || 1) + ZOOM_STEP);
+      applyZoom(currentZoom() + ZOOM_STEP);
       event.preventDefault();
     } else if (k === "-" || k === "_" || k === "Subtract") {
-      applyZoom((companionPrefs.zoomFactor || 1) - ZOOM_STEP);
+      applyZoom(currentZoom() - ZOOM_STEP);
       event.preventDefault();
     } else if (k === "0" || k === "Insert") {
       applyZoom(1);
       event.preventDefault();
     }
   });
-  mainWindow.webContents.on("zoom-changed", (_event, direction) => {
-    const cur = companionPrefs.zoomFactor || 1;
-    applyZoom(direction === "in" ? cur + ZOOM_STEP : cur - ZOOM_STEP);
+  // Ctrl+mousewheel: Chromium has already applied the new zoom by the time this fires, so persist
+  // the real resulting factor instead of re-deriving a step (which fought the wheel and snapped).
+  mainWindow.webContents.on("zoom-changed", () => {
+    companionPrefs.zoomFactor = clampZoom(currentZoom());
+    saveCompanionPrefs();
   });
 
   // Auto-recover from a black screen. If Chromium's render process crashes (commonly an
