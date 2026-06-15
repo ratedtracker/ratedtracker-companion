@@ -9,7 +9,7 @@
 // Safari mixed-content problem. The API only ever reads WoWCombatLog*.txt and
 // RatedTracker.lua. It never uploads, copies, moves, or deletes anything.
 
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog } = require("electron");
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification } = require("electron");
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
@@ -126,6 +126,7 @@ async function handleWindowClose() {
 // ---------------------------------------------------------------------------
 
 let updateDownloaded = false;
+let updateReadyVersion = null;
 let manualUpdateCheck = false;
 
 function updatesSupported() {
@@ -166,6 +167,37 @@ function promptRestartToUpdate(version) {
         }
       }
     });
+}
+
+// Surface a downloaded update no matter the window state. Active window -> restart dialog.
+// Hidden in the tray -> OS toast that opens the restart dialog when clicked, so the user is
+// not forced to randomly poll "Check for updates".
+function notifyUpdateReady(version) {
+  const visible = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
+  if (visible) {
+    promptRestartToUpdate(version);
+    return;
+  }
+  try {
+    if (Notification && Notification.isSupported && Notification.isSupported()) {
+      const n = new Notification({
+        title: APP_NAME,
+        body:
+          (version ? "Version " + version + " is ready. " : "An update is ready. ") +
+          "Click to restart and install.",
+      });
+      n.on("click", () => {
+        showWindow();
+        promptRestartToUpdate(version);
+      });
+      n.show();
+      return;
+    }
+  } catch (e) {
+    /* fall through to forcing the window up */
+  }
+  showWindow();
+  promptRestartToUpdate(version);
 }
 
 function manualCheckForUpdates() {
@@ -225,8 +257,10 @@ function setupAutoUpdates() {
 
   autoUpdater.on("update-downloaded", (info) => {
     updateDownloaded = true;
+    updateReadyVersion = (info && info.version) || null;
     refreshTrayMenu();
-    promptRestartToUpdate(info && info.version);
+    if (tray) tray.setToolTip(APP_NAME + " - update ready (restart to install)");
+    notifyUpdateReady(updateReadyVersion);
   });
 
   autoUpdater.on("error", (err) => {
@@ -1058,7 +1092,7 @@ function refreshTrayMenu() {
       },
     },
     updateDownloaded
-      ? { label: "Restart to update", click: () => promptRestartToUpdate(null) }
+      ? { label: "Restart to update", click: () => promptRestartToUpdate(updateReadyVersion) }
       : { label: "Check for updates", click: manualCheckForUpdates },
     { label: "Re-detect WoW install", click: () => { retailRoot = detectRetailRoot(); refreshTrayMenu(); } },
     {
