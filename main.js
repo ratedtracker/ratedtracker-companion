@@ -9,7 +9,7 @@
 // Safari mixed-content problem. The API only ever reads WoWCombatLog*.txt and
 // RatedTracker.lua. It never uploads, copies, moves, or deletes anything.
 
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification } = require("electron");
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, screen } = require("electron");
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
@@ -60,6 +60,44 @@ function loadCompanionPrefs() {
   let z = Number(companionPrefs.zoomFactor);
   if (!isFinite(z) || z <= 0) z = 1;
   companionPrefs.zoomFactor = Math.max(0.5, Math.min(3, z));
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+}
+
+// Return the last saved window rect only if it still lands on a connected display, so a window
+// saved on a monitor that is now unplugged falls back to the default centered position.
+function getSavedBounds() {
+  const b = companionPrefs.windowBounds;
+  if (!b || typeof b !== "object") return null;
+  const x = Number(b.x);
+  const y = Number(b.y);
+  const w = Number(b.width);
+  const h = Number(b.height);
+  if (![x, y, w, h].every((n) => isFinite(n))) return null;
+  if (w < 200 || h < 200) return null;
+  const rect = { x, y, width: w, height: h };
+  try {
+    const displays = screen.getAllDisplays();
+    if (!displays.some((d) => rectsOverlap(rect, d.workArea))) return null;
+  } catch (e) {
+    return null;
+  }
+  return rect;
+}
+
+let saveBoundsTimer = null;
+function saveWindowBounds() {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
+  const maximized = mainWindow.isMaximized();
+  companionPrefs.maximized = maximized;
+  if (!maximized) companionPrefs.windowBounds = mainWindow.getBounds();
+  saveCompanionPrefs();
+}
+function scheduleSaveBounds() {
+  if (saveBoundsTimer) clearTimeout(saveBoundsTimer);
+  saveBoundsTimer = setTimeout(saveWindowBounds, 400);
 }
 
 function saveCompanionPrefs() {
@@ -949,9 +987,10 @@ function cleanUserAgent() {
 
 function createWindow() {
   const ic = iconPath();
-  mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 860,
+  const saved = getSavedBounds();
+  const winOpts = {
+    width: saved ? saved.width : 1280,
+    height: saved ? saved.height : 860,
     minWidth: 900,
     minHeight: 600,
     title: APP_NAME,
@@ -963,7 +1002,17 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
     },
-  });
+  };
+  if (saved) {
+    winOpts.x = saved.x;
+    winOpts.y = saved.y;
+  }
+  mainWindow = new BrowserWindow(winOpts);
+  if (companionPrefs.maximized) mainWindow.maximize();
+  mainWindow.on("resize", scheduleSaveBounds);
+  mainWindow.on("move", scheduleSaveBounds);
+  mainWindow.on("maximize", saveWindowBounds);
+  mainWindow.on("unmaximize", saveWindowBounds);
   mainWindow.loadURL(SITE_URL);
 
   // Browser-style zoom (Ctrl +/-/0 and Ctrl+mousewheel). Persisted so the chosen size
@@ -1061,6 +1110,7 @@ function createWindow() {
     return { action: "deny" };
   });
   mainWindow.on("close", (e) => {
+    saveWindowBounds();
     if (app.isQuitting) return;
     e.preventDefault();
     void handleWindowClose();
