@@ -36,7 +36,7 @@ const ALLOWED_ORIGINS = new Set(["https://ratedtracker.com", "https://www.ratedt
 let mainWindow = null;
 let tray = null;
 let retailRoot = null;
-let companionPrefs = { closeAction: null, rememberClose: false };
+let companionPrefs = { closeAction: null, rememberClose: false, zoomFactor: 1 };
 
 function prefsFile() {
   try {
@@ -51,12 +51,15 @@ function loadCompanionPrefs() {
     const raw = JSON.parse(fs.readFileSync(prefsFile(), "utf-8"));
     if (raw && typeof raw === "object") companionPrefs = raw;
   } catch (e) {
-    companionPrefs = { closeAction: null, rememberClose: false };
+    companionPrefs = { closeAction: null, rememberClose: false, zoomFactor: 1 };
   }
   if (companionPrefs.closeAction !== "tray" && companionPrefs.closeAction !== "quit") {
     companionPrefs.closeAction = null;
   }
   companionPrefs.rememberClose = !!companionPrefs.rememberClose;
+  let z = Number(companionPrefs.zoomFactor);
+  if (!isFinite(z) || z <= 0) z = 1;
+  companionPrefs.zoomFactor = Math.max(0.5, Math.min(3, z));
 }
 
 function saveCompanionPrefs() {
@@ -928,6 +931,47 @@ function createWindow() {
     },
   });
   mainWindow.loadURL(SITE_URL);
+
+  // Browser-style zoom (Ctrl +/-/0 and Ctrl+mousewheel). Persisted so the chosen size
+  // survives restarts, and reapplied on every load since Chromium resets it per navigation.
+  const ZOOM_MIN = 0.5;
+  const ZOOM_MAX = 3;
+  const ZOOM_STEP = 0.1;
+  function applyZoom(f) {
+    const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(f * 100) / 100));
+    companionPrefs.zoomFactor = z;
+    try {
+      mainWindow.webContents.setZoomFactor(z);
+    } catch (e) {
+      /* window gone */
+    }
+    saveCompanionPrefs();
+  }
+  mainWindow.webContents.on("did-finish-load", () => {
+    try {
+      mainWindow.webContents.setZoomFactor(companionPrefs.zoomFactor || 1);
+    } catch (e) {
+      /* window gone */
+    }
+  });
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown" || !input.control || input.alt || input.meta) return;
+    const k = input.key || "";
+    if (k === "+" || k === "=" || k === "Add") {
+      applyZoom((companionPrefs.zoomFactor || 1) + ZOOM_STEP);
+      event.preventDefault();
+    } else if (k === "-" || k === "_" || k === "Subtract") {
+      applyZoom((companionPrefs.zoomFactor || 1) - ZOOM_STEP);
+      event.preventDefault();
+    } else if (k === "0" || k === "Insert") {
+      applyZoom(1);
+      event.preventDefault();
+    }
+  });
+  mainWindow.webContents.on("zoom-changed", (_event, direction) => {
+    const cur = companionPrefs.zoomFactor || 1;
+    applyZoom(direction === "in" ? cur + ZOOM_STEP : cur - ZOOM_STEP);
+  });
 
   // Auto-recover from a black screen. If Chromium's render process crashes (commonly an
   // out-of-memory after a long session parsing large combat logs) or the load fails, reload the
