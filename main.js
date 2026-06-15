@@ -207,6 +207,34 @@ function promptRestartToUpdate(version) {
     });
 }
 
+// In-window banner so the update is visible just by looking at the app, not only via toast.
+// Reinjected after every load since the page navigates/reloads. The button hits the local API
+// the site already talks to, so no preload/IPC is needed.
+function injectUpdateBanner(version) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const label = version ? "v" + version + " is ready" : "An update is ready";
+  const js =
+    "(function(){" +
+    "if(document.getElementById('rt-update-banner'))return;" +
+    "var bar=document.createElement('div');bar.id='rt-update-banner';" +
+    "bar.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#15311a;color:#e6e6ea;border-bottom:2px solid #74d06c;font:600 13px system-ui,Segoe UI,Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;gap:14px;padding:8px 14px;box-shadow:0 4px 14px rgba(0,0,0,.45);';" +
+    "var t=document.createElement('span');t.textContent='RatedTracker Companion ' + " +
+    JSON.stringify(label) +
+    " + '. Restart to install.';" +
+    "var b=document.createElement('button');b.textContent='Restart now';" +
+    "b.style.cssText='background:rgba(116,208,108,.18);color:#74d06c;border:1px solid #2f5a2e;border-radius:5px;padding:5px 12px;font:600 13px system-ui;cursor:pointer;';" +
+    "b.onclick=function(){b.disabled=true;b.textContent='Restarting...';fetch('http://127.0.0.1:" +
+    PORT +
+    "/api/update/restart').catch(function(){});};" +
+    "var x=document.createElement('button');x.textContent='Later';" +
+    "x.style.cssText='background:none;color:#9a9aa6;border:none;cursor:pointer;font:13px system-ui;';" +
+    "x.onclick=function(){bar.remove();};" +
+    "bar.appendChild(t);bar.appendChild(b);bar.appendChild(x);" +
+    "(document.body||document.documentElement).appendChild(bar);" +
+    "})();";
+  mainWindow.webContents.executeJavaScript(js).catch(() => {});
+}
+
 // Surface a downloaded update no matter the window state. Active window -> restart dialog.
 // Hidden in the tray -> OS toast that opens the restart dialog when clicked, so the user is
 // not forced to randomly poll "Check for updates".
@@ -298,6 +326,7 @@ function setupAutoUpdates() {
     updateReadyVersion = (info && info.version) || null;
     refreshTrayMenu();
     if (tray) tray.setToolTip(APP_NAME + " - update ready (restart to install)");
+    injectUpdateBanner(updateReadyVersion);
     notifyUpdateReady(updateReadyVersion);
   });
 
@@ -924,6 +953,31 @@ function handleRequest(req, res) {
     return serveCombatLog(req, res, u);
   }
 
+  if (p === "/api/update/status") {
+    return sendJson(req, res, {
+      ok: true,
+      updateReady: !!updateDownloaded,
+      version: updateReadyVersion,
+      currentVersion: app.getVersion(),
+    });
+  }
+
+  if (p === "/api/update/restart") {
+    if (updateDownloaded && autoUpdater) {
+      sendJson(req, res, { ok: true });
+      app.isQuitting = true;
+      setTimeout(() => {
+        try {
+          autoUpdater.quitAndInstall();
+        } catch (e) {
+          /* update still applies on next quit */
+        }
+      }, 200);
+      return;
+    }
+    return sendJson(req, res, { ok: false, error: "no update ready" });
+  }
+
   return send404(req, res, "not found");
 }
 
@@ -1036,6 +1090,7 @@ function createWindow() {
     } catch (e) {
       /* window gone */
     }
+    if (updateDownloaded) injectUpdateBanner(updateReadyVersion);
   });
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown" || !input.control || input.alt || input.meta) return;
