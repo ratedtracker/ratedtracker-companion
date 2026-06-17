@@ -66,8 +66,10 @@ function rectsOverlap(a, b) {
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 
-// Return the last saved window rect only if it still lands on a connected display, so a window
-// saved on a monitor that is now unplugged falls back to the default centered position.
+// Return the last saved window rect (size + position) verbatim. The off-screen check is NOT done
+// here: at cold boot the app auto-launches before the display layout is ready, and rejecting the
+// rect then would throw away the user's saved size and position and recenter at default size.
+// ensureWindowOnScreen() handles the genuine unplugged-monitor case later, once displays settle.
 function getSavedBounds() {
   const b = companionPrefs.windowBounds;
   if (!b || typeof b !== "object") return null;
@@ -77,14 +79,26 @@ function getSavedBounds() {
   const h = Number(b.height);
   if (![x, y, w, h].every((n) => isFinite(n))) return null;
   if (w < 200 || h < 200) return null;
-  const rect = { x, y, width: w, height: h };
+  return { x, y, width: w, height: h };
+}
+
+// If the restored window lands on no connected display (a monitor unplugged since last run),
+// move it onto the primary display while keeping its size. Run deferred so a cold-boot layout
+// that is still initializing does not trigger a premature recenter.
+function ensureWindowOnScreen() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  let rect;
   try {
+    rect = mainWindow.getBounds();
     const displays = screen.getAllDisplays();
-    if (!displays.some((d) => rectsOverlap(rect, d.workArea))) return null;
+    if (displays.some((d) => rectsOverlap(rect, d.workArea))) return;
+    const wa = screen.getPrimaryDisplay().workArea;
+    const x = Math.round(wa.x + Math.max(0, (wa.width - rect.width) / 2));
+    const y = Math.round(wa.y + Math.max(0, (wa.height - rect.height) / 2));
+    mainWindow.setBounds({ x: x, y: y, width: rect.width, height: rect.height });
   } catch (e) {
-    return null;
+    /* best effort */
   }
-  return rect;
 }
 
 let saveBoundsTimer = null;
@@ -1050,6 +1064,9 @@ function createWindow() {
   mainWindow.on("move", scheduleSaveBounds);
   mainWindow.on("maximize", saveWindowBounds);
   mainWindow.on("unmaximize", saveWindowBounds);
+  // Correct an off-screen position only after the display layout has settled, so a cold-boot
+  // auto-launch keeps the saved size and position instead of recentering at default size.
+  setTimeout(ensureWindowOnScreen, 2500);
   mainWindow.loadURL(SITE_URL);
 
   // Browser-style zoom (Ctrl +/-/0 and Ctrl+mousewheel). Persisted so the chosen size
