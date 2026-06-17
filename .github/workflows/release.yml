@@ -11,10 +11,14 @@ permissions:
 
 jobs:
   release:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # ubuntu-22.04 is pinned on purpose: the AppImage toolchain is flaky on
+        # the newer ubuntu-latest (24.04) image, which is what intermittently
+        # failed the Linux job while Windows/macOS passed.
+        os: [windows-latest, macos-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -27,6 +31,18 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Stagger so the three matrix jobs do not race to create the same GitHub
+      # release; the loser of that race is what intermittently fails one OS.
+      # Windows creates the release first, the others upload to it.
+      - name: Stagger publish
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            windows-latest) sleep 0 ;;
+            macos-latest) sleep 30 ;;
+            *) sleep 60 ;;
+          esac
 
       - name: Build and publish
         env:

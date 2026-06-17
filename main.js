@@ -9,7 +9,7 @@
 // Safari mixed-content problem. The API only ever reads WoWCombatLog*.txt and
 // RatedTracker.lua. It never uploads, copies, moves, or deletes anything.
 
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, screen } = require("electron");
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, screen, ipcMain } = require("electron");
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
@@ -180,31 +180,13 @@ function checkForUpdatesSafe() {
   }
 }
 
+// Surface the restart prompt as the themed in-window banner (matches the app/site
+// look) instead of a native OS message box. The banner's Restart button hits the
+// local /api/update/restart endpoint, which runs quitAndInstall.
 function promptRestartToUpdate(version) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  dialog
-    .showMessageBox(mainWindow, {
-      type: "info",
-      buttons: ["Restart now", "Later"],
-      defaultId: 0,
-      cancelId: 1,
-      noLink: true,
-      title: APP_NAME,
-      message: "A new version of RatedTracker Companion is ready.",
-      detail:
-        (version ? "Version " + version + " has been downloaded. " : "An update has been downloaded. ") +
-        "Restart to finish updating.",
-    })
-    .then((r) => {
-      if (r.response === 0) {
-        app.isQuitting = true;
-        try {
-          autoUpdater.quitAndInstall();
-        } catch (e) {
-          /* if quitAndInstall fails, the update still applies on next quit */
-        }
-      }
-    });
+  showWindow();
+  injectUpdateBanner(version != null ? version : updateReadyVersion);
 }
 
 // In-window banner so the update is visible just by looking at the app, not only via toast.
@@ -1055,6 +1037,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: path.join(__dirname, "preload.js"),
     },
   };
   if (saved) {
@@ -1096,6 +1079,12 @@ function createWindow() {
     companionPrefs.zoomFactor = z;
     saveCompanionPrefs();
   }
+  // Ctrl+mousewheel from the preload: step zoom explicitly so it does not depend on
+  // Chromium's native gesture (which does not fire reliably in this shell).
+  ipcMain.removeAllListeners("rt-zoom-wheel");
+  ipcMain.on("rt-zoom-wheel", (_e, dir) => {
+    applyZoom(currentZoom() + (dir > 0 ? ZOOM_STEP : -ZOOM_STEP));
+  });
   // Chromium resets a webContents to its per-origin default zoom on every navigation, and that
   // reset can land a tick AFTER did-finish-load fires, so a single setZoomFactor there does not
   // stick (the user's chosen size snaps back to 100% on the next reload). Reapply the saved zoom
