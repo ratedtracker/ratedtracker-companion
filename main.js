@@ -451,6 +451,185 @@ function latestCombatLog() {
   return list.length ? path.join(logsDir(), list[0].name) : null;
 }
 
+// Full combat-log inventory for the Logs management tab (not capped like listCombatLogs).
+// The newest file is the current/active log WoW writes to; everything else is archived.
+function listAllCombatLogs() {
+  const d = logsDir();
+  if (!d) return [];
+  let names;
+  try {
+    names = fs.readdirSync(d);
+  } catch (e) {
+    return [];
+  }
+  const out = [];
+  for (const n of names) {
+    if (!/^wowcombatlog.*\.txt$/i.test(n)) continue;
+    const info = fileInfo(path.join(d, n));
+    if (info) out.push(info);
+  }
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out;
+}
+
+// Best-effort write-lock probe. WoW keeps the active log open for writing without a write
+// share on Windows, so opening it "r+" throws EBUSY/EPERM/EACCES while the game is running.
+// A closed game releases the handle and the open succeeds, making the file deletable.
+function isFileLocked(p) {
+  let fd = null;
+  try {
+    fd = fs.openSync(p, "r+");
+    return false;
+  } catch (e) {
+    const code = e && e.code;
+    if (code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ETXTBSY") return true;
+    return false;
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch (e2) {}
+    }
+  }
+}
+
+function combatLogInventory() {
+  const d = logsDir();
+  const all = listAllCombatLogs();
+  const activeName = all.length ? all[0].name : null;
+  const logs = all.map((f) => {
+    const full = path.join(d, f.name);
+    const isActive = f.name === activeName;
+    const locked = isActive ? isFileLocked(full) : false;
+    return {
+      name: f.name,
+      size: f.size,
+      mtime: f.mtime,
+      active: isActive,
+      locked: isActive && locked,
+      status: isActive ? "Active" : "Archived",
+    };
+  });
+  let totalSize = 0;
+  let reclaimable = 0;
+  for (const l of logs) {
+    totalSize += l.size;
+    if (!l.active) reclaimable += l.size;
+  }
+  const archivedCount = logs.filter((l) => !l.active).length;
+  return {
+    ok: true,
+    logsDir: d && fs.existsSync(d) ? d : null,
+    count: logs.length,
+    archivedCount: archivedCount,
+    totalSize: totalSize,
+    reclaimable: reclaimable,
+    activeName: activeName,
+    retention: companionPrefs.logRetention || 0,
+    logs: logs,
+  };
+}
+
+// Delete a set of archived combat logs by name. The active log and any locked file are refused.
+// Returns what was deleted, what was skipped, and how many bytes were reclaimed.
+function deleteCombatLogs(names) {
+  const d = logsDir();
+  if (!d) return { ok: false, error: "WoW Logs folder not found." };
+  const all = listAllCombatLogs();
+  const activeName = all.length ? all[0].name : null;
+  const wanted = Array.isArray(names) ? names : [];
+  const deleted = [];
+  const skipped = [];
+  let freed = 0;
+  for (const raw of wanted) {
+    const safe = path.basename(String(raw || ""));
+    if (!/^wowcombatlog.*\.txt$/i.test(safe)) {
+      skipped.push({ name: raw, reason: "invalid" });
+      continue;
+    }
+    if (safe === activeName) {
+      skipped.push({ name: safe, reason: "active" });
+      continue;
+    }
+    const full = path.join(d, safe);
+    let size = 0;
+    try {
+      size = fs.statSync(full).size;
+    } catch (e) {
+      skipped.push({ name: safe, reason: "missing" });
+      continue;
+    }
+    if (isFileLocked(full)) {
+      skipped.push({ name: safe, reason: "locked" });
+      continue;
+    }
+    try {
+      fs.unlinkSync(full);
+      deleted.push(safe);
+      freed += size;
+    } catch (e) {
+      skipped.push({ name: safe, reason: String((e && e.code) || "error") });
+    }
+  }
+  return { ok: true, deleted: deleted, skipped: skipped, freed: freed };
+}
+
+// Enforce "keep last N" retention: delete archived logs beyond the newest N. The active log
+// always counts as kept and is never auto-deleted. Runs on startup and after a retention change.
+function applyLogRetention() {
+  const keep = Number(companionPrefs.logRetention) || 0;
+  if (!keep || keep < 1) return;
+  const all = listAllCombatLogs();
+  if (all.length <= keep) return;
+  const toDelete = all.slice(keep).map((f) => f.name);
+  if (toDelete.length) deleteCombatLogs(toDelete);
+}
+
+function handleLogsDelete(req, res) {
+  if (req.method !== "POST") return send404(req, res, "use POST");
+  let body = "";
+  let tooBig = false;
+  req.on("data", (c) => {
+    body += c;
+    if (body.length > 1e6) {
+      tooBig = true;
+      try {
+        req.destroy();
+      } catch (e) {}
+    }
+  });
+  req.on("end", () => {
+    if (tooBig) return sendJson(req, res, { ok: false, error: "payload too large" }, 413);
+    let names = [];
+    try {
+      const parsed = JSON.parse(body || "{}");
+      names = parsed && Array.isArray(parsed.names) ? parsed.names : [];
+    } catch (e) {
+      return sendJson(req, res, { ok: false, error: "bad json" }, 400);
+    }
+    const result = deleteCombatLogs(names);
+    if (!result.ok) return sendJson(req, res, result, 500);
+    return sendJson(req, res, Object.assign(result, { inventory: combatLogInventory() }));
+  });
+  req.on("error", () => {
+    try {
+      sendJson(req, res, { ok: false, error: "request error" }, 500);
+    } catch (e) {}
+  });
+}
+
+function handleLogsRetention(req, res, u) {
+  const raw = u.searchParams.get("keep");
+  let keep = parseInt(raw, 10);
+  if (!Number.isFinite(keep) || keep < 0) keep = 0;
+  const allowed = [0, 10, 25, 50, 100];
+  if (allowed.indexOf(keep) < 0) keep = 0;
+  companionPrefs.logRetention = keep;
+  saveCompanionPrefs();
+  applyLogRetention();
+  return sendJson(req, res, { ok: true, retention: keep, inventory: combatLogInventory() });
+}
+
 function latestSavedVariables() {
   const base = wtfAccountDir();
   if (!base) return null;
@@ -475,6 +654,62 @@ function latestSavedVariables() {
     }
   }
   return best;
+}
+
+// Every WoW install on the machine that has a WTF/Account directory. A player can run more
+// than one retail install (separate Battle.net installs, PTR-as-retail, etc.); option 2 of the
+// multi-account request unions accounts across all of them.
+function allWtfAccountDirs() {
+  const out = [];
+  const seen = Object.create(null);
+  const roots = candidateRoots();
+  if (retailRoot && roots.indexOf(retailRoot) < 0) roots.unshift(retailRoot);
+  for (const r of roots) {
+    const base = path.join(r, "WTF", "Account");
+    if (seen[base]) continue;
+    try {
+      if (fs.existsSync(base)) {
+        seen[base] = 1;
+        out.push(base);
+      }
+    } catch (e) {
+      /* keep looking */
+    }
+  }
+  return out;
+}
+
+// All RatedTracker.lua files across every account and every install, deduped by account folder
+// (newest mtime wins when the same account exists in two installs). Each player account writes
+// its own RatedTracker.lua; multi-account players have several.
+function allSavedVariables() {
+  const byAccount = Object.create(null);
+  for (const base of allWtfAccountDirs()) {
+    let accounts;
+    try {
+      accounts = fs.readdirSync(base);
+    } catch (e) {
+      continue;
+    }
+    for (const acct of accounts) {
+      const sv = path.join(base, acct, "SavedVariables", "RatedTracker.lua");
+      let st;
+      try {
+        st = fs.statSync(sv);
+      } catch (e) {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      const prev = byAccount[acct];
+      const mtime = Math.floor(st.mtimeMs);
+      if (!prev || mtime > prev.mtime) {
+        byAccount[acct] = { account: acct, path: sv, name: path.basename(sv), mtime: mtime, size: st.size };
+      }
+    }
+  }
+  const list = Object.keys(byAccount).map((k) => byAccount[k]);
+  list.sort((a, b) => b.mtime - a.mtime);
+  return list;
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +1004,112 @@ function send404(req, res, msg) {
   res.end(body);
 }
 
+// Local automatic backup. The site streams its full snapshot here and we write it to a single
+// file under the user's Documents so the browser File System Access prompt is never involved.
+function backupDir() {
+  let base = null;
+  try {
+    base = app.getPath("documents");
+  } catch (e) {
+    base = null;
+  }
+  if (!base) {
+    try {
+      base = app.getPath("userData");
+    } catch (e) {
+      base = os.tmpdir();
+    }
+  }
+  return path.join(base, "RatedTracker Backups");
+}
+
+function backupFilePath() {
+  return path.join(backupDir(), "RatedTracker-backup.json");
+}
+
+function backupStatusInfo() {
+  const fp = backupFilePath();
+  try {
+    const st = fs.statSync(fp);
+    return { ok: true, exists: true, dir: backupDir(), path: fp, size: st.size, mtime: Math.floor(st.mtimeMs) };
+  } catch (e) {
+    return { ok: true, exists: false, dir: backupDir(), path: fp };
+  }
+}
+
+// Stream the POST body to a temp file then atomically rename over the backup, so an aborted or
+// failed upload never truncates the prior good backup and nothing is buffered in memory.
+function handleBackupSave(req, res) {
+  if (req.method !== "POST") return send404(req, res, "use POST");
+  try {
+    fs.mkdirSync(backupDir(), { recursive: true });
+  } catch (e) {
+    return sendJson(req, res, { ok: false, error: String((e && e.message) || e) }, 500);
+  }
+  const finalPath = backupFilePath();
+  const tmpPath = finalPath + ".tmp-" + process.pid + "-" + Date.now();
+  let ws;
+  try {
+    ws = fs.createWriteStream(tmpPath);
+  } catch (e) {
+    return sendJson(req, res, { ok: false, error: String((e && e.message) || e) }, 500);
+  }
+  let failed = false;
+  function fail(e) {
+    if (failed) return;
+    failed = true;
+    try {
+      ws.destroy();
+    } catch (e2) {}
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch (e2) {}
+    try {
+      sendJson(req, res, { ok: false, error: String((e && e.message) || e) }, 500);
+    } catch (e2) {}
+  }
+  req.on("error", fail);
+  ws.on("error", fail);
+  ws.on("finish", function () {
+    if (failed) return;
+    try {
+      fs.renameSync(tmpPath, finalPath);
+      const st = fs.statSync(finalPath);
+      sendJson(req, res, { ok: true, path: finalPath, dir: backupDir(), size: st.size, mtime: Math.floor(st.mtimeMs) });
+    } catch (e) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (e2) {}
+      try {
+        sendJson(req, res, { ok: false, error: String((e && e.message) || e) }, 500);
+      } catch (e2) {}
+    }
+  });
+  req.pipe(ws);
+}
+
+function handleBackupLoad(req, res) {
+  const info = backupStatusInfo();
+  if (!info.exists) return send404(req, res, "no backup file");
+  let stream;
+  try {
+    stream = fs.createReadStream(info.path);
+  } catch (e) {
+    return sendJson(req, res, { ok: false, error: String((e && e.message) || e) }, 500);
+  }
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Length", info.size);
+  res.setHeader("Cache-Control", "no-store");
+  applyCors(req, res);
+  stream.on("error", function () {
+    try {
+      res.destroy();
+    } catch (e) {}
+  });
+  stream.pipe(res);
+}
+
 function serveCombatLog(req, res, u) {
   const name = u.searchParams.get("name");
   let offset = parseInt(u.searchParams.get("offset") || "", 10);
@@ -862,7 +1203,7 @@ function handleRequest(req, res) {
   if (req.method === "OPTIONS") {
     res.statusCode = originAllowed(req.headers.origin) ? 204 : 403;
     applyCors(req, res);
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     res.setHeader("Access-Control-Max-Age", "600");
     res.setHeader("Content-Length", "0");
@@ -875,9 +1216,21 @@ function handleRequest(req, res) {
       app: APP_NAME,
       version: app.getVersion(),
       desktop: true,
+      backup: true,
+      logs: true,
       wowDetected: retailRoot != null,
       retailRoot: retailRoot,
     });
+  }
+
+  if (p === "/api/backup/status") {
+    return sendJson(req, res, backupStatusInfo());
+  }
+  if (p === "/api/backup/save") {
+    return handleBackupSave(req, res);
+  }
+  if (p === "/api/backup/load") {
+    return handleBackupLoad(req, res);
   }
 
   if (p === "/oauth2/callback") {
@@ -908,18 +1261,41 @@ function handleRequest(req, res) {
   if (p === "/api/watch/status") {
     const cl = latestCombatLog();
     const sv = latestSavedVariables();
+    const svAll = allSavedVariables();
     return sendJson(req, res, {
       ok: true,
       combatLog: cl ? fileInfo(cl) : null,
       savedVariables: sv ? fileInfo(sv) : null,
+      savedVariablesList: svAll.map((e) => ({ account: e.account, name: e.name, mtime: e.mtime, size: e.size })),
       logsDir: logsDir() && fs.existsSync(logsDir()) ? logsDir() : null,
       wtfDir: wtfAccountDir() && fs.existsSync(wtfAccountDir()) ? wtfAccountDir() : null,
       source: "companion-desktop",
     });
   }
 
+  if (p === "/api/saved-variables-list") {
+    const svAll = allSavedVariables();
+    return sendJson(req, res, {
+      ok: true,
+      accounts: svAll.map((e) => ({ account: e.account, name: e.name, mtime: e.mtime, size: e.size })),
+    });
+  }
+
   if (p === "/api/saved-variables") {
-    const sv = latestSavedVariables();
+    let sv = null;
+    const wantAccount = u.searchParams.get("account");
+    if (wantAccount) {
+      const all = allSavedVariables();
+      for (const e of all) {
+        if (e.account === wantAccount) {
+          sv = e.path;
+          break;
+        }
+      }
+      if (!sv) return send404(req, res, "no SavedVariables/RatedTracker.lua for account " + wantAccount);
+    } else {
+      sv = latestSavedVariables();
+    }
     if (!sv) return send404(req, res, "no SavedVariables/RatedTracker.lua found");
     let data;
     try {
@@ -943,6 +1319,16 @@ function handleRequest(req, res) {
 
   if (p === "/api/wow-combat-log-list") {
     return sendJson(req, res, listCombatLogs());
+  }
+
+  if (p === "/api/logs/list") {
+    return sendJson(req, res, combatLogInventory());
+  }
+  if (p === "/api/logs/delete") {
+    return handleLogsDelete(req, res);
+  }
+  if (p === "/api/logs/retention") {
+    return handleLogsRetention(req, res, u);
   }
 
   if (p === "/api/wow-combat-log") {
@@ -1117,6 +1503,18 @@ function createWindow() {
     reapplySavedZoom();
     setTimeout(reapplySavedZoom, 80);
     setTimeout(reapplySavedZoom, 400);
+    // Tell the loaded site it is running inside this desktop shell and that the local server can
+    // write the automatic backup file directly. This lets the site skip the browser file-access
+    // prompt entirely and route backups to /api/backup/save without ever probing the loopback.
+    try {
+      mainWindow.webContents.executeJavaScript(
+        'window.RT_DESKTOP_APP={base:"http://127.0.0.1:' + PORT + '",backup:true,logs:true};' +
+          'try{window.dispatchEvent(new Event("rt-desktop-ready"));}catch(e){}',
+        true
+      ).catch(() => {});
+    } catch (e) {
+      /* best effort */
+    }
     if (updateDownloaded) injectUpdateBanner(updateReadyVersion);
   });
   mainWindow.webContents.on("before-input-event", (event, input) => {
@@ -1266,6 +1664,11 @@ if (!gotLock) {
     retailRoot = detectRetailRoot();
     loadGoogleStore();
     loadCompanionPrefs();
+    try {
+      applyLogRetention();
+    } catch (e) {
+      /* best effort */
+    }
     startApiServer();
     createWindow();
     buildTray();
