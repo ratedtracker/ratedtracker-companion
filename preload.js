@@ -13,6 +13,8 @@ window.addEventListener(
   "wheel",
   function (e) {
     if (!e.ctrlKey) return;
+    const t = e.target;
+    if (t && t.closest && t.closest("[data-map-viewport]")) return;
     e.preventDefault();
     ipcRenderer.send("rt-zoom-wheel", e.deltaY < 0 ? 1 : -1);
   },
