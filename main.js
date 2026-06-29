@@ -64,6 +64,9 @@ function loadCompanionPrefs() {
   if (!Number.isFinite(keep) || keep < 0) keep = 0;
   else if (keep > 1) keep = 1;
   companionPrefs.logRetention = keep;
+  if (typeof companionPrefs.retailRootOverride !== "string" || !companionPrefs.retailRootOverride) {
+    companionPrefs.retailRootOverride = null;
+  }
 }
 
 function rectsOverlap(a, b) {
@@ -409,6 +412,25 @@ function detectRetailRoot() {
   return null;
 }
 
+function looksLikeRetailRoot(p) {
+  try {
+    return !!p && (fs.existsSync(path.join(p, "Logs")) || fs.existsSync(path.join(p, "WTF")));
+  } catch (e) {
+    return false;
+  }
+}
+
+// A manual install path the user picked in Settings wins over auto-detection so it survives restarts.
+function resolveRetailRoot() {
+  const o = companionPrefs && companionPrefs.retailRootOverride;
+  if (looksLikeRetailRoot(o)) return o;
+  return detectRetailRoot();
+}
+
+function wowInfo() {
+  return { ok: true, path: retailRoot || null, logsDir: logsDir(), detected: retailRoot != null };
+}
+
 function logsDir() {
   return retailRoot ? path.join(retailRoot, "Logs") : null;
 }
@@ -632,6 +654,41 @@ function handleLogsRetention(req, res, u) {
   saveCompanionPrefs();
   applyLogRetention();
   return sendJson(req, res, { ok: true, retention: keep, inventory: combatLogInventory() });
+}
+
+function handleWowBrowse(req, res) {
+  const opts = {
+    title: "Select your World of Warcraft _retail_ folder",
+    properties: ["openDirectory"],
+  };
+  if (retailRoot) opts.defaultPath = retailRoot;
+  Promise.resolve(dialog.showOpenDialog(mainWindow || undefined, opts))
+    .then((result) => {
+      if (!result || result.canceled || !result.filePaths || !result.filePaths.length) {
+        return sendJson(req, res, Object.assign({ canceled: true }, wowInfo()));
+      }
+      let root = result.filePaths[0];
+      if (!looksLikeRetailRoot(root)) {
+        const sub = path.join(root, "_retail_");
+        if (looksLikeRetailRoot(sub)) root = sub;
+        else {
+          return sendJson(
+            req,
+            res,
+            Object.assign(
+              { ok: false, error: "That folder is not a WoW _retail_ folder (no Logs or WTF inside)." },
+              wowInfo()
+            )
+          );
+        }
+      }
+      retailRoot = root;
+      companionPrefs.retailRootOverride = root;
+      saveCompanionPrefs();
+      refreshTrayMenu();
+      return sendJson(req, res, wowInfo());
+    })
+    .catch((e) => sendJson(req, res, { ok: false, error: String((e && e.message) || e) }));
 }
 
 function latestSavedVariables() {
@@ -1222,6 +1279,7 @@ function handleRequest(req, res) {
       desktop: true,
       backup: true,
       logs: true,
+      wow: true,
       wowDetected: retailRoot != null,
       retailRoot: retailRoot,
     });
@@ -1333,6 +1391,24 @@ function handleRequest(req, res) {
   }
   if (p === "/api/logs/retention") {
     return handleLogsRetention(req, res, u);
+  }
+  if (p === "/api/logs/open") {
+    const d = logsDir();
+    if (d) shell.openPath(d);
+    return sendJson(req, res, { ok: !!d });
+  }
+  if (p === "/api/wow/info") {
+    return sendJson(req, res, wowInfo());
+  }
+  if (p === "/api/wow/redetect") {
+    companionPrefs.retailRootOverride = null;
+    saveCompanionPrefs();
+    retailRoot = detectRetailRoot();
+    refreshTrayMenu();
+    return sendJson(req, res, wowInfo());
+  }
+  if (p === "/api/wow/browse") {
+    return handleWowBrowse(req, res);
   }
 
   if (p === "/api/wow-combat-log") {
@@ -1512,13 +1588,14 @@ function createWindow() {
     // prompt entirely and route backups to /api/backup/save without ever probing the loopback.
     try {
       mainWindow.webContents.executeJavaScript(
-        'window.RT_DESKTOP_APP={base:"http://127.0.0.1:' + PORT + '",backup:true,logs:true};' +
+        'window.RT_DESKTOP_APP={base:"http://127.0.0.1:' + PORT + '",backup:true,logs:true,wow:true};' +
           'try{window.dispatchEvent(new Event("rt-desktop-ready"));}catch(e){}',
         true
       ).catch(() => {});
     } catch (e) {
       /* best effort */
     }
+    flushPendingHash();
     if (updateDownloaded) injectUpdateBanner(updateReadyVersion);
   });
   mainWindow.webContents.on("before-input-event", (event, input) => {
@@ -1617,20 +1694,13 @@ function refreshTrayMenu() {
   const menu = Menu.buildFromTemplate([
     { label: APP_NAME, enabled: false },
     { label: "Version " + app.getVersion(), enabled: false },
-    { label: "WoW: " + (retailRoot || "not detected"), enabled: false },
     { type: "separator" },
     { label: "Open RatedTracker", click: showWindow },
-    {
-      label: "Open WoW Logs folder",
-      enabled: !!logsDir(),
-      click: () => {
-        if (logsDir()) shell.openPath(logsDir());
-      },
-    },
+    { label: "Settings...", click: openSettings },
     updateDownloaded
       ? { label: "Restart to update", click: () => promptRestartToUpdate(updateReadyVersion) }
-      : { label: "Check for updates", click: manualCheckForUpdates },
-    { label: "Re-detect WoW install", click: () => { retailRoot = detectRetailRoot(); refreshTrayMenu(); } },
+      : { label: "Check for Updates", click: manualCheckForUpdates },
+    { type: "separator" },
     {
       label: process.platform === "win32" ? "Start with Windows" : "Start at login",
       type: "checkbox",
@@ -1638,7 +1708,6 @@ function refreshTrayMenu() {
       click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }),
     },
     { type: "separator" },
-    { label: "Not affiliated with or endorsed by Blizzard Entertainment.", enabled: false },
     { label: "Quit", click: () => { app.isQuitting = true; app.quit(); } },
   ]);
   tray.setContextMenu(menu);
@@ -1650,6 +1719,26 @@ function showWindow() {
     mainWindow.show();
     mainWindow.focus();
   }
+}
+
+let pendingHash = null;
+function flushPendingHash() {
+  if (!pendingHash || !mainWindow || !mainWindow.webContents) return;
+  const h = pendingHash;
+  pendingHash = null;
+  mainWindow.webContents
+    .executeJavaScript("location.hash=" + JSON.stringify(h) + ";", true)
+    .catch(() => {});
+}
+function navigateRenderer(hash) {
+  pendingHash = hash;
+  if (mainWindow && mainWindow.webContents && !mainWindow.webContents.isLoading()) {
+    flushPendingHash();
+  }
+}
+function openSettings() {
+  showWindow();
+  navigateRenderer("#companion");
 }
 
 // Single instance: focus the existing window instead of launching a second copy.
@@ -1665,9 +1754,9 @@ if (!gotLock) {
     } catch (e) {
       /* keep default UA */
     }
-    retailRoot = detectRetailRoot();
     loadGoogleStore();
     loadCompanionPrefs();
+    retailRoot = resolveRetailRoot();
     try {
       applyLogRetention();
     } catch (e) {
