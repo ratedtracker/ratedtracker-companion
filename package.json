@@ -1,7 +1,7 @@
 {
   "name": "ratedtracker-companion",
   "productName": "RatedTracker Companion",
-  "version": "1.1.10",
+  "version": "1.1.11",
   "description": "RatedTracker desktop app. Auto-syncs your World of Warcraft combat logs to ratedtracker.com.",
   "author": "RatedTracker",
   "license": "UNLICENSED",

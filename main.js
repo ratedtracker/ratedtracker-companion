@@ -60,6 +60,10 @@ function loadCompanionPrefs() {
   let z = Number(companionPrefs.zoomFactor);
   if (!isFinite(z) || z <= 0) z = 1;
   companionPrefs.zoomFactor = Math.max(0.5, Math.min(3, z));
+  let keep = Number(companionPrefs.logRetention);
+  if (!Number.isFinite(keep) || keep < 0) keep = 0;
+  else if (keep > 1) keep = 1;
+  companionPrefs.logRetention = keep;
 }
 
 function rectsOverlap(a, b) {
@@ -574,8 +578,8 @@ function deleteCombatLogs(names) {
   return { ok: true, deleted: deleted, skipped: skipped, freed: freed };
 }
 
-// Enforce "keep last N" retention: delete archived logs beyond the newest N. The active log
-// always counts as kept and is never auto-deleted. Runs on startup and after a retention change.
+// Enforce retention: keep=1 keeps only the current (newest) log and deletes all archived logs.
+// keep=0 disables automatic cleanup. The active log is never auto-deleted.
 function applyLogRetention() {
   const keep = Number(companionPrefs.logRetention) || 0;
   if (!keep || keep < 1) return;
@@ -622,7 +626,7 @@ function handleLogsRetention(req, res, u) {
   const raw = u.searchParams.get("keep");
   let keep = parseInt(raw, 10);
   if (!Number.isFinite(keep) || keep < 0) keep = 0;
-  const allowed = [0, 10, 25, 50, 100];
+  const allowed = [0, 1];
   if (allowed.indexOf(keep) < 0) keep = 0;
   companionPrefs.logRetention = keep;
   saveCompanionPrefs();
