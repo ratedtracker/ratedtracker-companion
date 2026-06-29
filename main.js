@@ -431,6 +431,32 @@ function wowInfo() {
   return { ok: true, path: retailRoot || null, logsDir: logsDir(), detected: retailRoot != null };
 }
 
+function clampZoomFactor(f) {
+  return Math.max(0.5, Math.min(3, Math.round((Number(f) || 1) * 100) / 100));
+}
+function getZoomFactor() {
+  try {
+    if (mainWindow && mainWindow.webContents) {
+      const z = mainWindow.webContents.getZoomFactor();
+      if (z && isFinite(z)) return z;
+    }
+  } catch (e) {
+    /* window gone */
+  }
+  return companionPrefs.zoomFactor || 1;
+}
+function setZoomFactor(f) {
+  const z = clampZoomFactor(f);
+  try {
+    if (mainWindow && mainWindow.webContents) mainWindow.webContents.setZoomFactor(z);
+  } catch (e) {
+    /* window gone */
+  }
+  companionPrefs.zoomFactor = z;
+  saveCompanionPrefs();
+  return z;
+}
+
 function logsDir() {
   return retailRoot ? path.join(retailRoot, "Logs") : null;
 }
@@ -1409,6 +1435,24 @@ function handleRequest(req, res) {
   }
   if (p === "/api/wow/browse") {
     return handleWowBrowse(req, res);
+  }
+  if (p === "/api/zoom") {
+    return sendJson(req, res, { ok: true, factor: getZoomFactor(), min: 0.5, max: 3, step: 0.1 });
+  }
+  if (p === "/api/zoom/set") {
+    const factor = setZoomFactor(u.searchParams.get("factor"));
+    return sendJson(req, res, { ok: true, factor: factor });
+  }
+  if (p === "/api/app/reload") {
+    sendJson(req, res, { ok: true });
+    setTimeout(() => {
+      try {
+        if (mainWindow && mainWindow.webContents) mainWindow.webContents.reloadIgnoringCache();
+      } catch (e) {
+        /* window gone */
+      }
+    }, 120);
+    return;
   }
 
   if (p === "/api/wow-combat-log") {
