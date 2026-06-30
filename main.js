@@ -1459,6 +1459,11 @@ function handleRequest(req, res) {
     return serveCombatLog(req, res, u);
   }
 
+  if (p === "/api/update/check") {
+    manualCheckForUpdates();
+    return sendJson(req, res, { ok: true });
+  }
+
   if (p === "/api/update/status") {
     return sendJson(req, res, {
       ok: true,
