@@ -1579,6 +1579,7 @@ function createWindow() {
   mainWindow.on("move", scheduleSaveBounds);
   mainWindow.on("maximize", saveWindowBounds);
   mainWindow.on("unmaximize", saveWindowBounds);
+  mainWindow.on("closed", () => { mainWindow = null; });
   // Correct an off-screen position only after the display layout has settled, so a cold-boot
   // auto-launch keeps the saved size and position instead of recentering at default size.
   setTimeout(ensureWindowOnScreen, 2500);
@@ -1763,11 +1764,15 @@ function refreshTrayMenu() {
 }
 
 function showWindow() {
-  if (!mainWindow) createWindow();
-  else {
-    mainWindow.show();
-    mainWindow.focus();
+  // A closed window is destroyed but the ref stays truthy; recreate instead of
+  // calling show() on a destroyed object (the "Object has been destroyed" crash).
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
   }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 }
 
 let pendingHash = null;
