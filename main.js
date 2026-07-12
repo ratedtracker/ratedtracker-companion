@@ -1497,24 +1497,41 @@ function handleRequest(req, res) {
       sv = latestSavedVariables();
     }
     if (!sv) return send404(req, res, "no SavedVariables/RatedTracker.lua found");
-    let data;
-    try {
-      data = fs.readFileSync(sv);
-    } catch (e) {
-      return send404(req, res, String(e));
-    }
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Content-Length", data.length);
-    res.setHeader("X-Sv-Filename", path.basename(sv));
-    try {
-      res.setHeader("X-Sv-Account-Path", path.basename(path.dirname(path.dirname(sv))));
-    } catch (e) {
-      /* ignore */
-    }
-    res.setHeader("Cache-Control", "no-store");
-    applyCors(req, res);
-    return res.end(data);
+    // WoW rewrites RatedTracker.lua in place on /reload. A Sync that reads mid-write can parse a
+    // truncated file and import only some of the new games (e.g. Twin Peaks lands, Deephaul that
+    // finished seconds earlier is missing until the next flush). Wait until mtime+size are stable
+    // across two reads before returning the bytes.
+    void (async () => {
+      let data = null;
+      let prev = null;
+      for (let i = 0; i < 10; i++) {
+        let st;
+        try {
+          st = fs.statSync(sv);
+          data = fs.readFileSync(sv);
+        } catch (e) {
+          return send404(req, res, String(e));
+        }
+        const sig = Math.floor(st.mtimeMs) + ":" + st.size + ":" + data.length;
+        if (prev === sig) break;
+        prev = sig;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if (!data) return send404(req, res, "could not read SavedVariables");
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Content-Length", data.length);
+      res.setHeader("X-Sv-Filename", path.basename(sv));
+      try {
+        res.setHeader("X-Sv-Account-Path", path.basename(path.dirname(path.dirname(sv))));
+      } catch (e) {
+        /* ignore */
+      }
+      res.setHeader("Cache-Control", "no-store");
+      applyCors(req, res);
+      return res.end(data);
+    })();
+    return;
   }
 
   if (p === "/api/wow-combat-log-list") {
