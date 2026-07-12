@@ -817,25 +817,52 @@ let svDebounceTimer = null;
 const svLastMtime = new Map(); // file -> mtimeMs last acted on
 let svWatchStarted = false;
 
+function svImportMatchesJs() {
+  // Self-contained: does not depend on live-sync.js version or pullMatchesNow. The shell always
+  // fetches RatedTracker.lua from its own API (stable read) and merges via RT_loadSvFromTexts, then
+  // forces a match-history paint. This is what makes new games appear without relaunching the app
+  // after a site deploy or a wedged Sync button path.
+  return (
+    "(async function(){try{" +
+    "var base=(window.RT_DESKTOP_APP&&window.RT_DESKTOP_APP.base)||'http://127.0.0.1:3456';" +
+    "var listRes=await fetch(base+'/api/saved-variables-list',{cache:'no-store'});" +
+    "if(!listRes.ok)return {ok:false,err:'list'};" +
+    "var list=await listRes.json();" +
+    "var accounts=(list&&list.accounts)||[];" +
+    "var texts=[];" +
+    "for(var i=0;i<accounts.length;i++){" +
+    "var acct=accounts[i]&&accounts[i].account;" +
+    "var url=base+'/api/saved-variables'+(acct?('?account='+encodeURIComponent(acct)):'');" +
+    "var r=await fetch(url,{cache:'no-store'});" +
+    "if(r.ok)texts.push(await r.text());" +
+    "}" +
+    "if(!texts.length){" +
+    "var r2=await fetch(base+'/api/saved-variables',{cache:'no-store'});" +
+    "if(r2.ok)texts.push(await r2.text());" +
+    "}" +
+    "if(!texts.length||!window.RT_loadSvFromTexts)return {ok:false,err:'no-sv'};" +
+    "var result=await window.RT_loadSvFromTexts(texts,{forceRebuild:true,deferLink:true});" +
+    "if(window.RT_rebuildFromStore)await window.RT_rebuildFromStore('Live sync',{refreshCombatIndex:false});" +
+    "if(typeof window.RT_paintMatchHistory==='function')window.RT_paintMatchHistory();" +
+    "else{" +
+    "window.dispatchEvent(new CustomEvent('rt-data-ready',{detail:window.RT_MOCK}));" +
+    "window.dispatchEvent(new CustomEvent('rt-sync-ui-refresh',{detail:{light:false}}));" +
+    "}" +
+    "return {ok:true,added:(result&&result.added)||0,updated:(result&&result.updated)||0};" +
+    "}catch(e){return {ok:false,err:String(e&&e.message||e)};}})()"
+  );
+}
+
 function svTriggerSyncNow() {
   if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) return;
-  // Matches-first hook. Prefer pullMatchesNow so a combat-log busy latch cannot swallow the import.
-  // Fall back to syncNow / syncOnce for older site builds.
-  const js =
-    "(function(){try{" +
-    "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.pullMatchesNow){window.RT_LIVE_SYNC.pullMatchesNow({allowProbe:false});return 'pull';}" +
-    "if(window.RT_COMPANION_SYNC_NOW){window.RT_COMPANION_SYNC_NOW();return 'hook';}" +
-    "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.syncNow){window.RT_LIVE_SYNC.syncNow();return 'syncNow';}" +
-    "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.syncOnce){window.RT_LIVE_SYNC.syncOnce({force:true});return 'direct';}" +
-    "}catch(e){}return 'none';})();";
-  mainWindow.webContents.executeJavaScript(js, true).catch(() => {});
+  mainWindow.webContents.executeJavaScript(svImportMatchesJs(), true).catch(() => {});
 }
 
 function svScheduleSync() {
   if (svDebounceTimer) clearTimeout(svDebounceTimer);
-  // WoW writes the whole file in one flush; wait for it to settle before reading so the site never
-  // reads a half-written file, then sync.
-  svDebounceTimer = setTimeout(svTriggerSyncNow, 1200);
+  // WoW rewrites the whole file; wait for the flush to finish. Companion /api/saved-variables also
+  // waits for mtime+size stability, so this debounce is a first gate only.
+  svDebounceTimer = setTimeout(svTriggerSyncNow, 2000);
 }
 
 function svCheckMtimes(triggerOnChange) {
@@ -1481,6 +1508,19 @@ function handleRequest(req, res) {
     });
   }
 
+  // Desktop Sync / external trigger: run the self-contained SV import in the renderer and return
+  // the result. Does not depend on whatever live-sync.js build Chromium has cached.
+  if (p === "/api/sync/pull-matches" && (req.method === "POST" || req.method === "GET")) {
+    if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+      return sendJson(req, res, { ok: false, err: "no-window" }, 503);
+    }
+    void mainWindow.webContents
+      .executeJavaScript(svImportMatchesJs(), true)
+      .then((result) => sendJson(req, res, result && typeof result === "object" ? result : { ok: true, result }))
+      .catch((e) => sendJson(req, res, { ok: false, err: String(e && e.message ? e.message : e) }, 500));
+    return;
+  }
+
   if (p === "/api/saved-variables") {
     let sv = null;
     const wantAccount = u.searchParams.get("account");
@@ -1788,13 +1828,14 @@ function createWindow() {
     }
     flushPendingHash();
     if (updateDownloaded) injectUpdateBanner(updateReadyVersion);
-    // Start watching SavedVariables now that the renderer (and its sync hook) is loaded, so a WoW
-    // flush pushes an immediate sync instead of waiting for the site's interval poll.
+    // Start watching SavedVariables now that the renderer is loaded. A flush pushes an immediate
+    // self-contained import (svImportMatchesJs), not a call into possibly-stale live-sync.js.
     try {
       startSavedVariablesWatch();
     } catch (e) {
       /* best effort */
     }
+    setTimeout(svTriggerSyncNow, 1500);
   });
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown" || !input.control || input.alt || input.meta) return;
