@@ -800,6 +800,117 @@ function allSavedVariables() {
 }
 
 // ---------------------------------------------------------------------------
+// SavedVariables watcher
+//
+// WoW rewrites RatedTracker.lua wholesale when it flushes (on /reload and on
+// logout). The site's live-sync only re-reads on its interval poll, so a player
+// who logs out and immediately looks at the app saw nothing until the next tick
+// (up to a minute). Archon solves the same class of problem by watching the log
+// files and reacting on write instead of on a timer. We do the same here: watch
+// every SavedVariables dir with fs.watch for an instant signal, plus a low-rate
+// mtime poll as a hard fallback (fs.watch can silently miss on some Windows /
+// OneDrive / AV setups). On a real change we tell the renderer to sync now, so a
+// new game lands in match history within a second or two of logging out.
+const svWatchers = new Map(); // dir -> FSWatcher
+let svPollTimer = null;
+let svDebounceTimer = null;
+const svLastMtime = new Map(); // file -> mtimeMs last acted on
+let svWatchStarted = false;
+
+function svTriggerSyncNow() {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) return;
+  // Prefer the site's dedicated hook; fall back to driving live-sync directly so this works even on
+  // an older site build that predates the hook. Never probes the loopback beyond the companion the
+  // site already discovered at launch.
+  const js =
+    "(function(){try{" +
+    "if(window.RT_COMPANION_SYNC_NOW){window.RT_COMPANION_SYNC_NOW();return 'hook';}" +
+    "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.syncOnce){window.RT_LIVE_SYNC.syncOnce({force:true});return 'direct';}" +
+    "}catch(e){}return 'none';})();";
+  mainWindow.webContents.executeJavaScript(js, true).catch(() => {});
+}
+
+function svScheduleSync() {
+  if (svDebounceTimer) clearTimeout(svDebounceTimer);
+  // WoW writes the whole file in one flush; wait for it to settle before reading so the site never
+  // reads a half-written file, then sync.
+  svDebounceTimer = setTimeout(svTriggerSyncNow, 1200);
+}
+
+function svCheckMtimes(triggerOnChange) {
+  let changed = false;
+  for (const info of allSavedVariables()) {
+    let mt = 0;
+    try {
+      mt = Math.floor(fs.statSync(info.path).mtimeMs);
+    } catch (e) {
+      continue;
+    }
+    const prev = svLastMtime.get(info.path) || 0;
+    if (mt > prev) {
+      svLastMtime.set(info.path, mt);
+      if (prev !== 0) changed = true; // prev 0 = first observation on this launch, not a new game
+    }
+  }
+  if (changed && triggerOnChange) svScheduleSync();
+  return changed;
+}
+
+function svSyncWatchedDirs() {
+  const wantDirs = new Set();
+  for (const info of allSavedVariables()) {
+    wantDirs.add(path.dirname(info.path));
+  }
+  // Drop watchers for dirs that vanished.
+  for (const dir of Array.from(svWatchers.keys())) {
+    if (!wantDirs.has(dir)) {
+      try {
+        svWatchers.get(dir).close();
+      } catch (e) {
+        /* already closed */
+      }
+      svWatchers.delete(dir);
+    }
+  }
+  // Add watchers for new dirs (new account/install appearing while running).
+  for (const dir of wantDirs) {
+    if (svWatchers.has(dir)) continue;
+    try {
+      const w = fs.watch(dir, { persistent: false }, (_evt, filename) => {
+        if (!filename || String(filename).indexOf("RatedTracker.lua") === -1) return;
+        // Confirm the mtime actually advanced (fs.watch fires on many non-content events), then sync.
+        if (svCheckMtimes(false)) svScheduleSync();
+        else svScheduleSync();
+      });
+      w.on("error", () => {
+        try {
+          w.close();
+        } catch (e) {
+          /* ignore */
+        }
+        svWatchers.delete(dir);
+      });
+      svWatchers.set(dir, w);
+    } catch (e) {
+      /* dir not watchable; the poll fallback still covers it */
+    }
+  }
+}
+
+function startSavedVariablesWatch() {
+  if (svWatchStarted) return;
+  svWatchStarted = true;
+  // Seed baseline mtimes so the first real write (not the current on-disk state) triggers a sync.
+  svCheckMtimes(false);
+  svSyncWatchedDirs();
+  // Fallback poll: re-scan dirs (catches new accounts) and detect mtime bumps fs.watch may miss.
+  svPollTimer = setInterval(() => {
+    svSyncWatchedDirs();
+    svCheckMtimes(true);
+  }, 8000);
+}
+
+// ---------------------------------------------------------------------------
 // Google Drive OAuth (system browser + loopback)
 //
 // Google blocks OAuth inside embedded/desktop web views, so sign-in happens in the
@@ -1647,6 +1758,13 @@ function createWindow() {
     }
     flushPendingHash();
     if (updateDownloaded) injectUpdateBanner(updateReadyVersion);
+    // Start watching SavedVariables now that the renderer (and its sync hook) is loaded, so a WoW
+    // flush pushes an immediate sync instead of waiting for the site's interval poll.
+    try {
+      startSavedVariablesWatch();
+    } catch (e) {
+      /* best effort */
+    }
   });
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown" || !input.control || input.alt || input.meta) return;
