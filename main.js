@@ -819,12 +819,13 @@ let svWatchStarted = false;
 
 function svTriggerSyncNow() {
   if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) return;
-  // Prefer the site's dedicated hook; fall back to driving live-sync directly so this works even on
-  // an older site build that predates the hook. Never probes the loopback beyond the companion the
-  // site already discovered at launch.
+  // Matches-first hook. Prefer pullMatchesNow so a combat-log busy latch cannot swallow the import.
+  // Fall back to syncNow / syncOnce for older site builds.
   const js =
     "(function(){try{" +
+    "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.pullMatchesNow){window.RT_LIVE_SYNC.pullMatchesNow({allowProbe:false});return 'pull';}" +
     "if(window.RT_COMPANION_SYNC_NOW){window.RT_COMPANION_SYNC_NOW();return 'hook';}" +
+    "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.syncNow){window.RT_LIVE_SYNC.syncNow();return 'syncNow';}" +
     "if(window.RT_LIVE_SYNC&&window.RT_LIVE_SYNC.syncOnce){window.RT_LIVE_SYNC.syncOnce({force:true});return 'direct';}" +
     "}catch(e){}return 'none';})();";
   mainWindow.webContents.executeJavaScript(js, true).catch(() => {});
@@ -1694,7 +1695,19 @@ function createWindow() {
   // Correct an off-screen position only after the display layout has settled, so a cold-boot
   // auto-launch keeps the saved size and position instead of recentering at default size.
   setTimeout(ensureWindowOnScreen, 2500);
-  mainWindow.loadURL(SITE_URL);
+  // Always fetch a fresh site build. Cloudflare caches JS for hours; without clearing, the shell
+  // keeps a broken live-sync.js after a deploy and Sync now appears to do nothing until a full
+  // app reinstall. Clear then load so Sync fixes ship without asking the user to wipe cache.
+  const ses = mainWindow.webContents.session;
+  Promise.resolve(ses.clearCache())
+    .catch(() => {})
+    .then(() => {
+      try {
+        mainWindow.loadURL(SITE_URL);
+      } catch (e) {
+        mainWindow.loadURL(SITE_URL);
+      }
+    });
 
   // Browser-style zoom (Ctrl +/-/0 and Ctrl+mousewheel). Persisted so the chosen size
   // survives restarts, and reapplied on every load since Chromium resets it per navigation.
