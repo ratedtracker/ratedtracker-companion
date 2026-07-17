@@ -824,6 +824,7 @@ function svImportMatchesJs() {
   // after a site deploy or a wedged Sync button path.
   return (
     "(async function(){try{" +
+    "window.RT_EXPORT=null;" +
     "var base=(window.RT_DESKTOP_APP&&window.RT_DESKTOP_APP.base)||'http://127.0.0.1:3456';" +
     "var listRes=await fetch(base+'/api/saved-variables-list',{cache:'no-store'});" +
     "if(!listRes.ok)return {ok:false,err:'list'};" +
@@ -1253,18 +1254,57 @@ function backupFilePath() {
   return path.join(backupDir(), "RatedTracker-backup.json");
 }
 
+function backupPrevPath() {
+  return path.join(backupDir(), "RatedTracker-backup.prev.json");
+}
+
+function readBackupMatchCount(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const st = fs.fstatSync(fd);
+    const n = Math.min(8192, st.size);
+    if (n <= 0) return null;
+    const buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, 0);
+    const head = buf.toString("utf8");
+    const m = head.match(/"match_count"\s*:\s*(\d+)/);
+    if (!m) return null;
+    const count = Number(m[1]);
+    return Number.isFinite(count) ? count : null;
+  } catch (e) {
+    return null;
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch (e2) {}
+    }
+  }
+}
+
 function backupStatusInfo() {
   const fp = backupFilePath();
   try {
     const st = fs.statSync(fp);
-    return { ok: true, exists: true, dir: backupDir(), path: fp, size: st.size, mtime: Math.floor(st.mtimeMs) };
+    const matchCount = readBackupMatchCount(fp);
+    return {
+      ok: true,
+      exists: true,
+      dir: backupDir(),
+      path: fp,
+      size: st.size,
+      mtime: Math.floor(st.mtimeMs),
+      match_count: matchCount,
+    };
   } catch (e) {
-    return { ok: true, exists: false, dir: backupDir(), path: fp };
+    return { ok: true, exists: false, dir: backupDir(), path: fp, match_count: null };
   }
 }
 
 // Stream the POST body to a temp file then atomically rename over the backup, so an aborted or
 // failed upload never truncates the prior good backup and nothing is buffered in memory.
+// Hard rule: never replace an existing backup with one that has fewer matches.
 function handleBackupSave(req, res) {
   if (req.method !== "POST") return send404(req, res, "use POST");
   try {
@@ -1273,6 +1313,7 @@ function handleBackupSave(req, res) {
     return sendJson(req, res, { ok: false, error: String((e && e.message) || e) }, 500);
   }
   const finalPath = backupFilePath();
+  const prevPath = backupPrevPath();
   const tmpPath = finalPath + ".tmp-" + process.pid + "-" + Date.now();
   let ws;
   try {
@@ -1299,9 +1340,45 @@ function handleBackupSave(req, res) {
   ws.on("finish", function () {
     if (failed) return;
     try {
+      const incomingCount = readBackupMatchCount(tmpPath);
+      const existingCount = readBackupMatchCount(finalPath);
+      if (
+        existingCount != null &&
+        incomingCount != null &&
+        incomingCount < existingCount
+      ) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch (e2) {}
+        return sendJson(
+          req,
+          res,
+          {
+            ok: false,
+            error: "refused-shrink",
+            existing_match_count: existingCount,
+            incoming_match_count: incomingCount,
+            path: finalPath,
+          },
+          409
+        );
+      }
+      if (fs.existsSync(finalPath)) {
+        try {
+          fs.copyFileSync(finalPath, prevPath);
+        } catch (e2) {}
+      }
       fs.renameSync(tmpPath, finalPath);
       const st = fs.statSync(finalPath);
-      sendJson(req, res, { ok: true, path: finalPath, dir: backupDir(), size: st.size, mtime: Math.floor(st.mtimeMs) });
+      sendJson(req, res, {
+        ok: true,
+        path: finalPath,
+        dir: backupDir(),
+        size: st.size,
+        mtime: Math.floor(st.mtimeMs),
+        match_count: incomingCount,
+        prev_path: fs.existsSync(prevPath) ? prevPath : null,
+      });
     } catch (e) {
       try {
         fs.unlinkSync(tmpPath);
@@ -1518,6 +1595,82 @@ function handleRequest(req, res) {
       .executeJavaScript(svImportMatchesJs(), true)
       .then((result) => sendJson(req, res, result && typeof result === "object" ? result : { ok: true, result }))
       .catch((e) => sendJson(req, res, { ok: false, err: String(e && e.message ? e.message : e) }, 500));
+    return;
+  }
+
+  // Soft-load the live site with a cache bust. Does not quit the app; only refreshes the window
+  // contents so a website deploy (store.js etc.) actually reaches the open companion session.
+  if (p === "/api/sync/reload-site" && (req.method === "POST" || req.method === "GET")) {
+    if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+      return sendJson(req, res, { ok: false, err: "no-window" }, 503);
+    }
+    const ses = mainWindow.webContents.session;
+    const hash = String(u.searchParams.get("hash") || "#matches");
+    void Promise.resolve(ses.clearCache())
+      .catch(() => {})
+      .then(() => {
+        try {
+          mainWindow.webContents.loadURL(SITE_URL.replace(/\/?$/, "/") + "?rtbust=" + Date.now() + hash);
+        } catch (e) {
+          return sendJson(req, res, { ok: false, err: String(e && e.message ? e.message : e) }, 500);
+        }
+        return sendJson(req, res, { ok: true });
+      });
+    return;
+  }
+
+  if (p === "/api/sync/diagnose" && (req.method === "POST" || req.method === "GET")) {
+    if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+      return sendJson(req, res, { ok: false, err: "no-window" }, 503);
+    }
+    const want = String(u.searchParams.get("date") || "07/12/26 07:17");
+    const js =
+      "(async function(){var want=" +
+      JSON.stringify(want) +
+      ";var out={store:!!(window.RT_STORE&&window.RT_STORE.available)};try{" +
+      "if(window.RT_STORE&&window.RT_STORE.getMeta)out.account_characters=await window.RT_STORE.getMeta('account_characters');" +
+      "if(window.RT_STORE&&window.RT_STORE.getAllMatches){var all=await window.RT_STORE.getAllMatches();out.storeCount=all.length;" +
+      "out.hits=all.filter(function(m){return String(m.date||'').indexOf(want)>=0;}).map(function(m){return{owner:(m.export_context&&m.export_context.owner_character)||m._ownerCharKey,date:m.date,map:m.map,mapName:m.mapName,spec:m.playerSpec,mmrPre:m.mmrPre,mmrPost:m.mmrPost,sig:window.RT_STORE.signature(m)};});" +
+      "out.augustToday=all.filter(function(m){var o=(m.export_context&&m.export_context.owner_character)||m._ownerCharKey||'';return o.indexOf('August')>=0&&String(m.date||'').indexOf('07/12/26')>=0;}).map(function(m){return{owner:(m.export_context&&m.export_context.owner_character)||m._ownerCharKey,date:m.date,map:m.map,mapName:m.mapName,mmrPre:m.mmrPre,mmrPost:m.mmrPost};}).slice(0,15);}" +
+      "out.exportCount=window.RT_EXPORT&&window.RT_EXPORT.matches?window.RT_EXPORT.matches.length:null;" +
+      "out.exportHits=window.RT_EXPORT&&window.RT_EXPORT.matches?window.RT_EXPORT.matches.filter(function(m){return String(m.date||'').indexOf(want)>=0;}).length:null;" +
+      "out.mockHits=window.RT_MOCK&&window.RT_MOCK.matches?window.RT_MOCK.matches.filter(function(m){return String(m.date||'').indexOf(want)>=0;}).length:null;" +
+      "out.hasLoad=typeof window.RT_loadSvFromTexts;out.hasPaint=typeof window.RT_paintMatchHistory;" +
+      "out.desktop=!!window.RT_DESKTOP_APP;out.hash=location.hash;out.href=location.href;" +
+      "out.mockTop=(window.RT_MOCK&&window.RT_MOCK.matches||[]).slice(0,8).map(function(m){return{date:m.date,map:m.mapName||m.map,owner:(m.export_context&&m.export_context.owner_character)||m._ownerCharKey,mmrPost:m.mmrPost};});" +
+      "var sels={};document.querySelectorAll('select').forEach(function(el,i){var lab=((el.id||'')+' '+(el.name||'')+' '+(el.className||'')+' '+(el.getAttribute('aria-label')||'')).toLowerCase();var txt=(el.innerText||'').slice(0,80);if(/char|owner|player|spec|bracket|season|map/.test(lab)||/Kneekappa|August|Lobby|All /.test(txt))sels[(el.id||el.name||('s'+i))]=el.value;});out.sels=sels;" +
+      "if(window.RT_paintMatchHistory)window.RT_paintMatchHistory();" +
+      "out.tableFirst=[];document.querySelectorAll('[data-view=\"matches\"] tbody tr, .matches-table tbody tr, #matches-table tbody tr, table tbody tr').forEach(function(tr,i){if(i<6)out.tableFirst.push(String(tr.innerText||'').replace(/\\s+/g,' ').slice(0,140));});" +
+      "}catch(e){out.err=String(e&&e.message||e);}return out;})()";
+    void mainWindow.webContents
+      .executeJavaScript(js, true)
+      .then((result) => sendJson(req, res, result && typeof result === "object" ? result : { ok: true, result }))
+      .catch((e) => sendJson(req, res, { ok: false, err: String(e && e.message ? e.message : e) }, 500));
+    return;
+  }
+
+  if (p === "/api/sync/eval" && req.method === "POST") {
+    if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) {
+      return sendJson(req, res, { ok: false, err: "no-window" }, 503);
+    }
+    let body = "";
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 200000) body = body.slice(0, 200000);
+    });
+    req.on("end", () => {
+      let code = body;
+      try {
+        const j = JSON.parse(body);
+        if (j && typeof j.code === "string") code = j.code;
+      } catch (e) {
+        /* raw JS body */
+      }
+      void mainWindow.webContents
+        .executeJavaScript(String(code || "null"), true)
+        .then((result) => sendJson(req, res, { ok: true, result }))
+        .catch((e) => sendJson(req, res, { ok: false, err: String(e && e.message ? e.message : e) }, 500));
+    });
     return;
   }
 
