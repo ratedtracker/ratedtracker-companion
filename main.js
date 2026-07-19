@@ -1963,6 +1963,43 @@ function createWindow() {
       /* window gone */
     }
   }
+  // Leaving fullscreen/maximize often leaves Chromium layout + zoom paint stuck at the
+  // larger size (scoreboards clip, media queries do not reflow). Nudge zoom and fire resize.
+  let layoutRefreshTimer = null;
+  function refreshLayoutAfterWindowChromeChange() {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const z = clampZoom(companionPrefs.zoomFactor || 1);
+    try {
+      mainWindow.webContents.setZoomFactor(Math.min(ZOOM_MAX, z + 0.0001));
+      mainWindow.webContents.setZoomFactor(z);
+    } catch (e) {
+      /* window gone */
+    }
+    try {
+      mainWindow.webContents
+        .executeJavaScript(
+          'try{window.dispatchEvent(new Event("resize"));' +
+            'if(window.visualViewport){window.visualViewport.dispatchEvent(new Event("resize"));}' +
+            '}catch(e){}',
+          true
+        )
+        .catch(() => {});
+    } catch (e) {
+      /* best effort */
+    }
+  }
+  function scheduleLayoutRefresh() {
+    if (layoutRefreshTimer) clearTimeout(layoutRefreshTimer);
+    layoutRefreshTimer = setTimeout(() => {
+      layoutRefreshTimer = null;
+      refreshLayoutAfterWindowChromeChange();
+      setTimeout(refreshLayoutAfterWindowChromeChange, 80);
+    }, 40);
+  }
+  mainWindow.on("enter-full-screen", scheduleLayoutRefresh);
+  mainWindow.on("leave-full-screen", scheduleLayoutRefresh);
+  mainWindow.on("maximize", scheduleLayoutRefresh);
+  mainWindow.on("unmaximize", scheduleLayoutRefresh);
   mainWindow.webContents.on("did-finish-load", () => {
     reapplySavedZoom();
     setTimeout(reapplySavedZoom, 80);
